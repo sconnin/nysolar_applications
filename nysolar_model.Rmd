@@ -1,0 +1,235 @@
+---
+title: "solar_model"
+author: "sean connin"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message = FALSE) # set global options
+
+```
+
+Install libraries
+
+```{r}
+library(tidyverse)
+library(RSocrata) # streamline api request
+library(magrittr)
+library(janitor)
+library(usethis) # set up Renviron for project
+library(dlookr)
+library(flextable)
+library(lubridate)
+```
+Set up credentials - api token
+
+* edit_r_environ()  #open Renviron and store api token as 
+
+```{r}
+
+api<-Sys.getenv("api_token")
+
+```
+
+Acquire data via. api
+
+Note: beginning dimensions (120247, 32)
+
+```{r}
+
+# query endpoint and filter based on program status and type
+
+url <- "https://data.ny.gov/resource/3x8r-34rs.json?Project Status=Complete&Program Type=Residential/Small Commercial"
+
+df<-read.socrata(url, app_token = api)  # credential stored in Renviron
+
+closeAllConnections()
+
+```
+clean and subset data 
+
+Note that georeference.coordinates is a vector of lists. each containing lat and long. 
+
+We can unnest if necessary:
+
+* unnest_wider(georeference.coordinates)%>%  # use rectangle package in purrr to unnest list elements
+    
+* rename(longitude = ...1, latitude = ...2)%>%   # assign names to unnested cols
+
+We will remove from working dataset and can add back in later if required
+
+```{r}
+
+
+df_mod<- tibble(df)%>%
+    
+    drop_na(project_number, date_application_received, date_install, project_cost, project_status)%>%
+    
+    select(!c(reporting_period, state, program_type, project_status, legacy_project_number, primary_inverter_model_number, pv_module_model_number, affordable_solar, green_jobs_green_new_york_participant, georeference.type, georeference.coordinates))%>%
+    
+    janitor::remove_empty(which = c("rows", "cols"))%>% # remove any rows/cols with no values 
+    
+    distinct()%>%     # remove duplicate rows
+
+    mutate_if(is_character, str_replace_all, '\\$|,|z_|<', '')%>%   # clean any special chars in character variables
+    
+    relocate(county, .after = city)%>%
+    
+    mutate_if(is_character, str_replace_all, "No|no",'N')%>%
+    
+    mutate_if(is_character, str_replace_all, "Yes|yes",'Y')%>%
+    
+    mutate_if(is_character, str_replace_all, "Nn-Residential",'Commercial')%>%
+    
+    mutate_at(vars(inverter_quantity, pv_module_quantity, expected_kwh_annual_production), funs(as.integer))%>% 
+    
+    mutate_at(vars(project_cost, totalnameplatekwdc, incentive), funs(as.double))%>%
+    
+    mutate_at(vars(electric_utility, sector, purchase_type), funs(as_factor))  #as_factor is forecats
+
+
+```
+
+# evaluate count and proportion of missingness
+
+Notes:
+
+* We are missing 64% of the col 'remote_net_metering'; we will remove this column
+* Given the large obs count = 120247 and low level of missingness (< 5%) within cols, we will drop rows with missing entries
+
+```{r}
+
+# create table to describe missing data
+
+df_mod%>%
+    diagnose()%>%
+    dplyr::select(-unique_count, -unique_rate)%>%
+    filter(missing_count>0)%>%
+    arrange(desc(missing_count))%>%
+    flextable()
+
+# drop remote_net_metering and rows with NA
+
+df_mod%<>%
+    dplyr::select(!c(remote_net_metering))%>%
+    drop_na()
+
+# confirm removal of all rows/cols with NA
+
+sum(is.na(df_mod))
+
+```
+Engineer project_days as date_install - date_application_received using lubridate package
+
+```{r}
+df_mod%<>%
+    
+    mutate(year_completed = year(date_install), .after=date_install)%>%  
+    
+    mutate(days=difftime(date_install, date_application_received, units = "days"), .after=year_completed)%>%
+    
+    separate(days, into = 'completion_days', sep = " ")%>%
+    
+    mutate_at(vars(completion_days), funs(as.integer))
+
+df_mod%<>%
+    select(!c(date_application_received, date_install))
+
+View(df_mod)
+
+```
+
+Partition dataset into residential and commercial tibbles
+
+```{r}
+df_mod%<>%
+```
+
+
+Run additional filters for data cleaning
+
+```{r}
+
+# subset residential sector and eval numeric types
+
+df_mod%>%
+    filter(sector %in% 'Residential')%>%
+    diagnose_numeric()%>%
+    dplyr::select(variables, min, mean, median, max, zero, minus)%>%
+    flextable(theme_fun = theme_booktabs())
+
+# subset commercial sector and eval numeric types
+
+df_mod%>%
+    filter(sector %in% 'Commercial')%>%
+    diagnose_numeric()%>%
+    dplyr::select(variables, min, mean, median, max, zero, minus)%>%
+    flextable(theme_fun = theme_booktabs())
+
+# subset residential sector and eval categorical types
+
+df_mod%>%
+    filter(sector %in% 'Residential')%>%
+    diagnose_category()%>%
+    flextable(theme_fun = theme_booktabs())
+
+# subset commerical sector and eval categorical types
+
+df_mod%>%
+    filter(sector %in% 'Commercial')%>%
+    diagnose_category()%>%
+    flextable(theme_fun = theme_booktabs())
+
+# remove rows where completion_days = 0 or less, based on diagnose_numeric results
+
+df_mod%<>%
+    filter(completion_days > 0 & project_cost > 0 & inverter_quantity >0 & totalnameplatekwdc > 0)
+
+
+
+
+
+
+
+
+plot(df_mod$completion_days)
+
+
+df_mod%>%find_skewness(index=FALSE, thres=TRUE)
+
+df_mod%>%normality() # wilkes-shapiro
+
+df_mod%>%plot_normality()
+
+unique(df_mod$sector)
+```
+outliers
+
+```{r}
+
+df_mod%>%
+    filter(sector %in% 'Residential')%>%
+    dplyr::select(find_outliers(df_mod, index = FALSE)) %>% 
+    plot_outlier()
+
+
+
+df_mod%>%
+    filter(sector %in% 'Commercial')%>%
+    dplyr::select(find_outliers(df_mod, index = FALSE)) %>% 
+    plot_outlier()
+    
+
+df_mod%>%
+    filter(sector %in% 'Residential')%>%
+    diagnose_outlier()%>%
+    flextable() 
+
+df_mod%>%
+    filter(sector %in% 'Commercial')%>%
+    diagnose_outlier()%>% 
+    flextable() 
+
+
+```
+
